@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel
@@ -70,8 +70,8 @@ class HandoffManager:
             record_id=str(uuid.uuid4()),
             request=request,
             status=HandoffStatus.pending,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+            created_at=datetime.now(tz=timezone.utc),
+            updated_at=datetime.now(tz=timezone.utc),
         )
         self._records[record.record_id] = record
         return record
@@ -88,7 +88,7 @@ class HandoffManager:
             reason="Accepted by receiving agent.",
         )
         record.status = HandoffStatus.accepted
-        record.updated_at = datetime.utcnow()
+        record.updated_at = datetime.now(tz=timezone.utc)
         return record
 
     def start(self, record_id: str) -> HandoffRecord:
@@ -99,7 +99,7 @@ class HandoffManager:
                 f"Cannot start handoff in state {record.status.value!r}."
             )
         record.status = HandoffStatus.in_progress
-        record.updated_at = datetime.utcnow()
+        record.updated_at = datetime.now(tz=timezone.utc)
         return record
 
     def complete(
@@ -116,7 +116,7 @@ class HandoffManager:
             )
         record.result = result
         record.status = HandoffStatus.completed
-        record.updated_at = datetime.utcnow()
+        record.updated_at = datetime.now(tz=timezone.utc)
         return record
 
     def reject(self, record_id: str, reason: str) -> HandoffRecord:
@@ -128,7 +128,7 @@ class HandoffManager:
             )
         record.response = HandoffResponse(accepted=False, reason=reason)
         record.status = HandoffStatus.rejected
-        record.updated_at = datetime.utcnow()
+        record.updated_at = datetime.now(tz=timezone.utc)
         return record
 
     def fail(self, record_id: str, reason: str) -> HandoffRecord:
@@ -143,7 +143,7 @@ class HandoffManager:
             )
         record.response = HandoffResponse(accepted=False, reason=reason)
         record.status = HandoffStatus.failed
-        record.updated_at = datetime.utcnow()
+        record.updated_at = datetime.now(tz=timezone.utc)
         return record
 
     def get(self, record_id: str) -> HandoffRecord:
