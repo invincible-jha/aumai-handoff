@@ -1,15 +1,474 @@
-# API Reference — Handoff
+# API Reference — aumai-handoff
 
-## Modules
+Full reference for all public classes, functions, and Pydantic models exposed by
+`aumai-handoff`. Everything documented here is exported from `aumai_handoff.core` or
+`aumai_handoff.models`.
 
-### `aumai_handoff.core`
+---
 
-Core logic module. Placeholder — replace with actual API documentation.
+## Module: `aumai_handoff.models`
 
-### `aumai_handoff.models`
+All data structures are Pydantic v2 `BaseModel` subclasses unless noted otherwise.
 
-Pydantic models. Placeholder — replace with actual model documentation.
+---
 
-### `aumai_handoff.cli`
+### `HandoffStatus`
 
-CLI entry point. Access via `aumai-handoff --help`.
+```python
+class HandoffStatus(str, Enum):
+    pending     = "pending"
+    accepted    = "accepted"
+    in_progress = "in_progress"
+    completed   = "completed"
+    rejected    = "rejected"
+    failed      = "failed"
+```
+
+Enum representing all possible lifecycle states for a handoff record.
+
+| Value | Terminal? | Description |
+|---|---|---|
+| `pending` | No | Record created; awaiting acknowledgement from the receiving agent. |
+| `accepted` | No | Receiving agent confirmed it will handle the task. |
+| `in_progress` | No | Receiving agent has begun work. |
+| `completed` | Yes | Task finished successfully; result payload attached. |
+| `rejected` | Yes | Receiving agent declined; reason stored in `HandoffResponse`. |
+| `failed` | Yes | Task could not be completed after acceptance; reason stored in `HandoffResponse`. |
+
+**Valid transitions:**
+
+```
+pending     -> accepted    (via accept())
+pending     -> rejected    (via reject())
+accepted    -> in_progress (via start())
+accepted    -> completed   (via complete())
+accepted    -> failed      (via fail())
+in_progress -> completed   (via complete())
+in_progress -> failed      (via fail())
+```
+
+**Example:**
+
+```python
+from aumai_handoff.models import HandoffStatus
+
+status = HandoffStatus.pending
+print(status.value)                  # "pending"
+print(isinstance(status, str))       # True
+print(status == "pending")           # True — str subclass
+```
+
+---
+
+### `HandoffRequest`
+
+```python
+class HandoffRequest(BaseModel):
+    from_agent: str
+    to_agent: str
+    task_description: str
+    context: dict[str, Any] = {}
+    priority: int = Field(default=5, ge=1, le=10)
+    deadline: datetime | None = None
+```
+
+A request to transfer a task from one agent to another.
+
+**Fields:**
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `from_agent` | `str` | Yes | — | Agent ID of the sender. |
+| `to_agent` | `str` | Yes | — | Agent ID of the intended receiver. May be overridden by `HandoffRouter`. |
+| `task_description` | `str` | Yes | — | Human-readable description of the task. Used by `HandoffRouter._extract_keywords()` for capability matching. |
+| `context` | `dict[str, Any]` | No | `{}` | Arbitrary payload passed to the receiver. Store structured data, file paths, parameters, etc. |
+| `priority` | `int` | No | `5` | Integer 1 (lowest) to 10 (critical). Validated by Pydantic. Values outside range raise `ValidationError`. |
+| `deadline` | `datetime \| None` | No | `None` | Optional UTC deadline. If provided, receiving systems can use this to prioritize scheduling. |
+
+**Example:**
+
+```python
+from datetime import datetime, timezone
+from aumai_handoff.models import HandoffRequest
+
+request = HandoffRequest(
+    from_agent="coordinator",
+    to_agent="analyst",
+    task_description="Analyze Q3 churn data and produce a summary.",
+    priority=9,
+    deadline=datetime(2026, 3, 31, 23, 59, tzinfo=timezone.utc),
+    context={
+        "data_source": "s3://data/churn-q3.parquet",
+        "output_format": "markdown",
+    },
+)
+```
+
+---
+
+### `HandoffResponse`
+
+```python
+class HandoffResponse(BaseModel):
+    accepted: bool
+    reason: str = ""
+    estimated_completion: datetime | None = None
+```
+
+The receiving agent's response to a handoff request. Attached to a `HandoffRecord` by
+`HandoffManager.accept()` or `HandoffManager.reject()`.
+
+**Fields:**
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `accepted` | `bool` | Yes | — | `True` if the agent accepted the task; `False` if rejected. |
+| `reason` | `str` | No | `""` | Human-readable explanation. Set automatically by `accept()` / `reject()` / `fail()`. |
+| `estimated_completion` | `datetime \| None` | No | `None` | Optional estimated UTC completion time. Not set automatically; set by application code. |
+
+---
+
+### `HandoffRecord`
+
+```python
+class HandoffRecord(BaseModel):
+    record_id: str
+    request: HandoffRequest
+    response: HandoffResponse | None = None
+    status: HandoffStatus = HandoffStatus.pending
+    result: dict[str, Any] = {}
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
+```
+
+The full audit trail for a single handoff. Created and mutated exclusively by
+`HandoffManager`.
+
+**Fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `record_id` | `str` | UUID4 string generated by `HandoffManager.create_handoff()`. |
+| `request` | `HandoffRequest` | The original handoff request, unchanged throughout the lifecycle. |
+| `response` | `HandoffResponse \| None` | Set when `accept()`, `reject()`, or `fail()` is called. |
+| `status` | `HandoffStatus` | Current lifecycle state. Updated by each lifecycle method. |
+| `result` | `dict[str, Any]` | Output payload set by `complete()`. Empty until the task is done. |
+| `created_at` | `datetime` | UTC timestamp when the record was created. |
+| `updated_at` | `datetime` | UTC timestamp updated on every lifecycle transition. |
+
+**Notes:**
+- `model_config = {"frozen": False}` — fields are mutated in-place by `HandoffManager`.
+- Serialize with `record.model_dump(mode="json")` or `record.model_dump_json()`.
+
+---
+
+## Module: `aumai_handoff.core`
+
+---
+
+### `AgentCapabilityRegistry`
+
+```python
+class AgentCapabilityRegistry(BaseModel):
+    agents: dict[str, list[str]] = {}
+```
+
+Tracks available agents and their capabilities. Used by `HandoffRouter` for automatic
+routing decisions.
+
+#### `AgentCapabilityRegistry.register`
+
+```python
+def register(self, agent_id: str, capabilities: list[str]) -> None
+```
+
+Register an agent with its capabilities.
+
+- **Parameters:**
+  - `agent_id` — unique identifier for the agent.
+  - `capabilities` — list of capability strings (e.g., `["analyze", "summarize"]`).
+- **Returns:** `None`
+- **Notes:** Replaces any previously registered capabilities for the same `agent_id`.
+
+#### `AgentCapabilityRegistry.unregister`
+
+```python
+def unregister(self, agent_id: str) -> None
+```
+
+Remove an agent from the registry.
+
+- **Parameters:**
+  - `agent_id` — the agent to remove.
+- **Returns:** `None`
+- **Notes:** Silently no-ops if `agent_id` is not registered.
+
+#### `AgentCapabilityRegistry.find_capable`
+
+```python
+def find_capable(self, required_capabilities: list[str]) -> list[str]
+```
+
+Return agent IDs that satisfy **all** required capabilities.
+
+- **Parameters:**
+  - `required_capabilities` — list of capability strings that the returned agents must all possess.
+- **Returns:** `list[str]` — agent IDs sorted by number of matching capabilities (descending). Empty list if no agent satisfies all requirements.
+- **Notes:** Uses a subset check: the agent's capability set must be a superset of the required set.
+
+**Example:**
+
+```python
+registry = AgentCapabilityRegistry()
+registry.register("alice", ["analyze", "summarize", "translate"])
+registry.register("bob",   ["execute", "report"])
+registry.register("carol", ["analyze", "visualize"])
+
+capable = registry.find_capable(["analyze"])
+print(capable)  # ["alice", "carol"] — sorted by match count; alice has 1 match, carol has 1 match
+
+capable = registry.find_capable(["analyze", "summarize"])
+print(capable)  # ["alice"] — only alice has both
+
+capable = registry.find_capable(["fly"])
+print(capable)  # [] — no agent has "fly"
+```
+
+---
+
+### `HandoffManager`
+
+```python
+class HandoffManager:
+    def __init__(self) -> None: ...
+```
+
+Creates and manages the lifecycle of `HandoffRecord` objects in memory.
+
+#### `HandoffManager.create_handoff`
+
+```python
+def create_handoff(self, request: HandoffRequest) -> HandoffRecord
+```
+
+Create a new handoff record in `pending` state.
+
+- **Parameters:**
+  - `request` — a `HandoffRequest` describing the task.
+- **Returns:** `HandoffRecord` — the newly created record with a UUID4 `record_id` and `status=pending`.
+- **Side effects:** Stores the record internally, keyed by `record_id`.
+
+#### `HandoffManager.accept`
+
+```python
+def accept(self, record_id: str) -> HandoffRecord
+```
+
+Transition a `pending` handoff to `accepted`.
+
+- **Parameters:**
+  - `record_id` — the UUID string of the record to accept.
+- **Returns:** `HandoffRecord` — the updated record.
+- **Raises:**
+  - `KeyError` — if `record_id` does not exist.
+  - `ValueError` — if the record is not in `pending` state.
+- **Side effects:** Sets `record.response` to `HandoffResponse(accepted=True, reason="Accepted by receiving agent.")`, updates `record.status` and `record.updated_at`.
+
+#### `HandoffManager.start`
+
+```python
+def start(self, record_id: str) -> HandoffRecord
+```
+
+Transition an `accepted` handoff to `in_progress`.
+
+- **Parameters:**
+  - `record_id` — the UUID string of the record.
+- **Returns:** `HandoffRecord` — the updated record.
+- **Raises:**
+  - `KeyError` — if `record_id` does not exist.
+  - `ValueError` — if the record is not in `accepted` state.
+
+#### `HandoffManager.complete`
+
+```python
+def complete(self, record_id: str, result: dict[str, Any]) -> HandoffRecord
+```
+
+Mark a handoff as `completed` and store the result payload.
+
+- **Parameters:**
+  - `record_id` — the UUID string of the record.
+  - `result` — arbitrary `dict[str, Any]` representing the task output.
+- **Returns:** `HandoffRecord` — the updated record.
+- **Raises:**
+  - `KeyError` — if `record_id` does not exist.
+  - `ValueError` — if the record is not in `accepted` or `in_progress` state.
+- **Side effects:** Sets `record.result`, updates `record.status` to `completed`, updates `record.updated_at`.
+
+#### `HandoffManager.reject`
+
+```python
+def reject(self, record_id: str, reason: str) -> HandoffRecord
+```
+
+Reject a `pending` handoff with a reason.
+
+- **Parameters:**
+  - `record_id` — the UUID string of the record.
+  - `reason` — human-readable explanation for the rejection.
+- **Returns:** `HandoffRecord` — the updated record.
+- **Raises:**
+  - `KeyError` — if `record_id` does not exist.
+  - `ValueError` — if the record is not in `pending` state.
+- **Side effects:** Sets `record.response` to `HandoffResponse(accepted=False, reason=reason)`, updates `record.status` to `rejected`.
+
+#### `HandoffManager.fail`
+
+```python
+def fail(self, record_id: str, reason: str) -> HandoffRecord
+```
+
+Mark an `accepted` or `in_progress` handoff as `failed`.
+
+- **Parameters:**
+  - `record_id` — the UUID string of the record.
+  - `reason` — human-readable explanation for the failure.
+- **Returns:** `HandoffRecord` — the updated record.
+- **Raises:**
+  - `KeyError` — if `record_id` does not exist.
+  - `ValueError` — if the record is not in `accepted` or `in_progress` state.
+
+#### `HandoffManager.get`
+
+```python
+def get(self, record_id: str) -> HandoffRecord
+```
+
+Retrieve a record by ID.
+
+- **Parameters:**
+  - `record_id` — the UUID string of the record.
+- **Returns:** `HandoffRecord`
+- **Raises:** `KeyError` — if `record_id` does not exist.
+
+#### `HandoffManager.list_records`
+
+```python
+def list_records(self, status: HandoffStatus | None = None) -> list[HandoffRecord]
+```
+
+Return all records, optionally filtered by status.
+
+- **Parameters:**
+  - `status` — if provided, only records in this status are returned.
+- **Returns:** `list[HandoffRecord]` — sorted by `created_at` ascending (oldest first).
+
+#### `HandoffManager.export`
+
+```python
+def export(self) -> list[dict[str, Any]]
+```
+
+Serialize all records to a list of JSON-compatible dicts.
+
+- **Returns:** `list[dict[str, Any]]` — suitable for `json.dump()`.
+- **Notes:** Uses Pydantic's `model_dump(mode="json")` which serializes `datetime` to ISO strings.
+
+#### `HandoffManager.import_records`
+
+```python
+def import_records(self, data: list[dict[str, Any]]) -> None
+```
+
+Restore records from a list of serialized dicts.
+
+- **Parameters:**
+  - `data` — a list as returned by `export()`.
+- **Returns:** `None`
+- **Side effects:** Adds all records from `data` to the internal store. Does not clear existing records first.
+- **Raises:** `ValidationError` (Pydantic) — if any item in `data` does not match the `HandoffRecord` schema.
+
+---
+
+### `HandoffRouter`
+
+```python
+class HandoffRouter:
+    def __init__(self, registry: AgentCapabilityRegistry) -> None: ...
+```
+
+Routes handoff requests to the best available agent using capability matching.
+
+#### `HandoffRouter.route`
+
+```python
+def route(
+    self,
+    request: HandoffRequest,
+    preferred_capabilities: list[str] | None = None,
+) -> str | None
+```
+
+Return the `agent_id` best suited to handle the request.
+
+- **Parameters:**
+  - `request` — the `HandoffRequest` to route.
+  - `preferred_capabilities` — explicit capability requirements. If `None`, capabilities are extracted from `request.task_description` using `_extract_keywords()`.
+- **Returns:** `str | None` — the best-matched `agent_id`, or `None` if no agents are registered.
+- **Routing algorithm:**
+  1. Extract keywords from `task_description` (words > 4 chars, lowercased, punctuation stripped).
+  2. Call `registry.find_capable(keywords)` to get sorted candidates.
+  3. If no capable agents found, fall back to any registered agent that is not `request.from_agent`.
+  4. Return the first candidate, or `None` if no candidates exist.
+
+**Example:**
+
+```python
+from aumai_handoff.core import AgentCapabilityRegistry, HandoffRouter
+from aumai_handoff.models import HandoffRequest
+
+registry = AgentCapabilityRegistry()
+registry.register("analyst", ["analyze", "report"])
+registry.register("writer",  ["write", "summarize"])
+
+router = HandoffRouter(registry)
+
+request = HandoffRequest(
+    from_agent="coordinator",
+    to_agent="",
+    task_description="Please analyze and report on market trends.",
+    priority=5,
+)
+
+agent_id = router.route(request)
+print(agent_id)  # "analyst"
+
+# With explicit preferred capabilities
+agent_id = router.route(request, preferred_capabilities=["summarize"])
+print(agent_id)  # "writer"
+```
+
+---
+
+## Module-level function: `_extract_keywords`
+
+```python
+def _extract_keywords(text: str) -> list[str]
+```
+
+Extract capability-matching keywords from free-form text.
+
+- **Parameters:**
+  - `text` — the task description string.
+- **Returns:** `list[str]` — lowercased words longer than 4 characters, with leading/trailing punctuation stripped.
+- **Notes:** This is a module-private utility used by `HandoffRouter.route()`. It is documented here for users who want to understand or override the routing keyword extraction logic.
+
+**Example:**
+
+```python
+from aumai_handoff.core import _extract_keywords
+
+keywords = _extract_keywords("Please analyze and report on market trends.")
+print(keywords)  # ["please", "analyze", "report", "market", "trends"]
+```
